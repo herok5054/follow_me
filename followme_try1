@@ -1,0 +1,228 @@
+#include <webots/lidar.h>
+#include <webots/motor.h>
+#include <webots/robot.h>
+#include <webots/camera.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+// ========================
+// GLOBAL DEFINES
+// ========================
+#define TIME_STEP 64
+
+#define BASE_FOLLOW_SPEED 2.0
+#define SAFE_DIST_MIN 0.5
+#define SAFE_DIST_MAX 1.2
+
+// ========================
+// ENUMS FOR STATE & MOOD
+// ========================
+typedef enum {
+  IDLE,
+  FOLLOW_ME
+} RobotState;
+
+typedef enum {
+  HAPPY,
+  ANGRY,
+  SAD
+} RobotMood;
+
+// ========================
+// COLOUR ENUM
+// ========================
+typedef enum {
+  NONE,
+  GREEN,
+  BLUE,
+  RED
+} DetectedColour;
+
+// ========================
+// DEVICE STRUCT
+// ========================
+typedef struct {
+  WbDeviceTag lidar;
+  WbDeviceTag rightMotor;
+  WbDeviceTag leftMotor;
+  WbDeviceTag camera;
+} DeviceTags;
+
+// ========================
+// INITIALISE DEVICES
+// ========================
+DeviceTags initializeDevices() {
+  DeviceTags d;
+
+  d.lidar = wb_robot_get_device("LDS-01");
+  wb_lidar_enable(d.lidar, TIME_STEP);
+
+  d.rightMotor = wb_robot_get_device("right wheel motor");
+  d.leftMotor  = wb_robot_get_device("left wheel motor");
+  wb_motor_set_position(d.rightMotor, INFINITY);
+  wb_motor_set_position(d.leftMotor, INFINITY);
+
+  d.camera = wb_robot_get_device("camera");
+  wb_camera_enable(d.camera, TIME_STEP);
+
+  return d;
+}
+
+// ========================
+// SIMPLE COLOUR DETECTION
+// ========================
+DetectedColour detectColour(DeviceTags *d) {
+  const unsigned char *img = wb_camera_get_image(d->camera);
+  int width = wb_camera_get_width(d->camera);
+  int height = wb_camera_get_height(d->camera);
+
+  long r = 0, g = 0, b = 0;
+  int count = 0;
+
+  // Sample centre of image
+  for (int x = width / 3; x < 2 * width / 3; x++) {
+    for (int y = height / 3; y < 2 * height / 3; y++) {
+      r += wb_camera_image_get_red(img, width, x, y);
+      g += wb_camera_image_get_green(img, width, x, y);
+      b += wb_camera_image_get_blue(img, width, x, y);
+      count++;
+    }
+  }
+
+  r /= count;
+  g /= count;
+  b /= count;
+
+  if (g > r + 40 && g > b + 40) return GREEN;
+  if (b > r + 40 && b > g + 40) return BLUE;
+  if (r > g + 40 && r > b + 40) return RED;
+
+  return NONE;
+}
+
+// ========================
+// DISTANCE FROM LIDAR
+// ========================
+double getFrontDistance(DeviceTags *d) {
+  const float *ranges = wb_lidar_get_range_image(d->lidar);
+  int width = wb_lidar_get_horizontal_resolution(d->lidar);
+  return ranges[width / 2];  // front beam
+}
+
+// ========================
+// PRINT STATE TO CONSOLE
+// ========================
+void printStatus(RobotState state, RobotMood mood, double blueTimer, double dist, double speed) {
+  const char *stateStr = (state == IDLE) ? "IDLE" : "FOLLOW_ME";
+  const char *moodStr  = (mood == HAPPY) ? "HAPPY" : (mood == ANGRY) ? "ANGRY" : "SAD";
+
+  printf("[STATE: %s]  [MOOD: %s]  [BLUE TIMER: %.2f s]  [DIST: %.2f m]  [SPEED: %.2f]\n",
+         stateStr, moodStr, blueTimer, dist, speed);
+}
+
+// ========================
+// MAIN CONTROLLER
+// ========================
+int main() {
+  wb_robot_init();
+  DeviceTags d = initializeDevices();
+
+  RobotState state = IDLE;
+  RobotMood mood = HAPPY;
+
+  double blueTimer = 0.0;
+  double speed = 0.0;
+
+  printf("=== TURTLEBOT FOLLOW-ME CONTROLLER STARTED ===\n");
+
+  while (wb_robot_step(TIME_STEP) != -1) {
+
+    DetectedColour colour = detectColour(&d);
+    double frontDist = getFrontDistance(&d);
+
+    // ========================
+    // RED CARD → EMERGENCY RESET
+    // ========================
+    if (colour == RED) {
+      state = IDLE;
+      mood = HAPPY;
+      blueTimer = 0.0;
+      speed = 0.0;
+
+      wb_motor_set_velocity(d.leftMotor, 0);
+      wb_motor_set_velocity(d.rightMotor, 0);
+
+      printf(">>> RED CARD DETECTED → EMERGENCY STOP + RESET <<<\n");
+      printStatus(state, mood, blueTimer, frontDist, speed);
+      continue;
+    }
+
+    // ========================
+    // GREEN CARD → ENTER FOLLOW MODE
+    // ========================
+    if (colour == GREEN && state == IDLE) {
+      state = FOLLOW_ME;
+      mood = HAPPY;
+      blueTimer = 0.0;
+
+      printf(">>> GREEN CARD DETECTED → ENTER FOLLOW MODE (HAPPY) <<<\n");
+    }
+
+    // ========================
+    // BLUE CARD → TIMED MOOD CONTROL
+    // ========================
+    if (colour == BLUE && state == FOLLOW_ME) {
+      blueTimer += TIME_STEP / 1000.0;
+
+      if (blueTimer >= 5.0) {
+        mood = SAD;
+      } 
+      else if (blueTimer >= 3.0) {
+        mood = ANGRY;
+      } 
+      else if (blueTimer >= 1.0) {
+        mood = HAPPY;
+      }
+
+      printf(">>> BLUE CARD ACTIVE → TIMER = %.2f s <<<\n", blueTimer);
+    } 
+    else {
+      blueTimer = 0.0;
+    }
+
+    // ========================
+    // FOLLOW LOGIC WITH SAFE DISTANCE
+    // ========================
+    if (state == FOLLOW_ME) {
+      double moodMultiplier = 1.0;
+
+      if (mood == ANGRY) moodMultiplier = 2.0;
+      if (mood == SAD)   moodMultiplier = 0.5;
+
+      speed = BASE_FOLLOW_SPEED * moodMultiplier;
+
+      // Distance safety override
+      if (frontDist < SAFE_DIST_MIN)
+        speed = 0.0;
+      else if (frontDist > SAFE_DIST_MAX)
+        speed = BASE_FOLLOW_SPEED * moodMultiplier;
+
+      wb_motor_set_velocity(d.leftMotor, speed);
+      wb_motor_set_velocity(d.rightMotor, speed);
+    }
+    else {
+      speed = 0.0;
+      wb_motor_set_velocity(d.leftMotor, 0);
+      wb_motor_set_velocity(d.rightMotor, 0);
+    }
+
+    // ========================
+    // PRINT EVERYTHING LIVE
+    // ========================
+    printStatus(state, mood, blueTimer, frontDist, speed);
+  }
+
+  wb_robot_cleanup();
+  return 0;
+}
